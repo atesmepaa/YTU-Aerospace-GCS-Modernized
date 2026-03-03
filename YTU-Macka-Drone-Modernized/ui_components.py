@@ -238,7 +238,7 @@ class MapWidget(ctk.CTkFrame):
         ctk.CTkSegmentedButton(
             hdr, values=["TASK1", "TASK2"],
             variable=self._map_mode,
-            command=lambda v: self._draww(),
+            command=self._on_mode_change,
             height=20, corner_radius=4,
             fg_color=T["bg_card_dark"],
             selected_color=T["accent"],
@@ -278,7 +278,7 @@ class MapWidget(ctk.CTkFrame):
         _cbtn("İZ SİL",   self._clear_trail, w=65, color="#1a2a1a").pack(side="left", padx=2, pady=6)
         _cbtn("WP SİL",   self._clear_wps,   w=65, color="#2a1a1a").pack(side="left", padx=2, pady=6)
 
-        # İrtifa + şerit + gönder
+        # İrtifa
         ctk.CTkLabel(ctrl, text="ALT:", font=(T["font_family"], 9),
                      text_color=T["text_secondary"]).pack(side="left", padx=(8,2))
         self._alt_e = ctk.CTkEntry(ctrl, width=36, height=22,
@@ -289,9 +289,15 @@ class MapWidget(ctk.CTkFrame):
                                    corner_radius=4)
         self._alt_e.pack(side="left", padx=(0,6))
 
-        ctk.CTkLabel(ctrl, text="ŞERİT:", font=(T["font_family"], 9),
-                     text_color=T["text_secondary"]).pack(side="left", padx=(0,2))
-        self._spc_e = ctk.CTkEntry(ctrl, width=32, height=22,
+        # Şerit — sadece TASK2'de görünür; her zaman pack'te kalır,
+        # TASK1'de içerik gizlenir böylece sıra bozulmaz.
+        self._spc_frame = ctk.CTkFrame(ctrl, fg_color="transparent")
+        self._spc_frame.pack(side="left", padx=(0,0))
+
+        self._spc_lbl = ctk.CTkLabel(self._spc_frame, text="SPACING:", font=(T["font_family"], 9),
+                                     text_color=T["text_secondary"])
+        self._spc_lbl.pack(side="left", padx=(0,2))
+        self._spc_e = ctk.CTkEntry(self._spc_frame, width=32, height=22,
                                    placeholder_text="3",
                                    font=(T["font_family"], 9),
                                    fg_color=T["bg_card_dark"],
@@ -305,6 +311,22 @@ class MapWidget(ctk.CTkFrame):
                       text_color="#000000",
                       font=(T["font_family"], 9, "bold"),
                       height=22, width=90, corner_radius=4).pack(side="left", padx=2)
+
+        # Başlangıç moduna göre şerit frame görünürlüğünü ayarla
+        self._update_spacing_visibility()
+
+    # ---------- mod değişimi ----------
+    def _on_mode_change(self, value: str):
+        self._update_spacing_visibility()
+        self._draww()
+
+    def _update_spacing_visibility(self):
+        if self._map_mode.get() == "TASK2":
+            self._spc_lbl.pack(side="left", padx=(0,2))
+            self._spc_e.pack(side="left", padx=(0,6))
+        else:
+            self._spc_lbl.pack_forget()
+            self._spc_e.pack_forget()
 
     # ---------- GPS → piksel ----------
     def _gps_to_px(self, lat, lon):
