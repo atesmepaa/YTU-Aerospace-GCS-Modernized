@@ -282,7 +282,7 @@ class MapWidget(ctk.CTkFrame):
         ctk.CTkLabel(ctrl, text="ALT:", font=(T["font_family"], 9),
                      text_color=T["text_secondary"]).pack(side="left", padx=(8,2))
         self._alt_e = ctk.CTkEntry(ctrl, width=36, height=22,
-                                   placeholder_text="20",
+                                   placeholder_text="10",
                                    font=(T["font_family"], 9),
                                    fg_color=T["bg_card_dark"],
                                    border_color=T["border"],
@@ -292,7 +292,7 @@ class MapWidget(ctk.CTkFrame):
         ctk.CTkLabel(ctrl, text="ŞERİT:", font=(T["font_family"], 9),
                      text_color=T["text_secondary"]).pack(side="left", padx=(0,2))
         self._spc_e = ctk.CTkEntry(ctrl, width=32, height=22,
-                                   placeholder_text="6",
+                                   placeholder_text="3",
                                    font=(T["font_family"], 9),
                                    fg_color=T["bg_card_dark"],
                                    border_color=T["border"],
@@ -430,10 +430,10 @@ class MapWidget(ctk.CTkFrame):
         self.waypoints.clear(); self._draww()
 
     def _request_upload(self):
-        try:    alt = float(self._alt_e.get() or "20")
-        except: alt = 20.0
-        try:    spc = max(2.0, float(self._spc_e.get() or "6"))
-        except: spc = 6.0
+        try:    alt = float(self._alt_e.get() or "10")
+        except: alt = 10.0
+        try:    spc = max(2.0, float(self._spc_e.get() or "3"))
+        except: spc = 3.0
         self._on_upload(waypoints=self.waypoints,
                         mode=self._map_mode.get(),
                         spacing_m=spc, alt=alt)
