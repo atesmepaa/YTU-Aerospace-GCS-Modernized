@@ -1,11 +1,18 @@
 """
-main.py - YTU Macka GCS v3
-Dark tactical aesthetic: siyah paneller, turuncu vurgular, Consolas font.
+main.py - YTU Macka GCS v4
+Teknofest geliştirmeleri:
+  - Görev state machine (HAZIR → WP YÜKLENİYOR → GÖREV → RTL → TAMAMLANDI)
+  - Figure-8 ×2: 3 WP (Direk1, Direk2, Pist) — resme uygun CW/CCW mantığı
+  - Görev tamamlanınca otomatik RTL
+  - Kill butonu: 2 sn basılı tut
+  - Scan önizleme çizgileri haritada
+  - drop_target mesajı → GUIDED + fly-to
 """
 
 import json
 import sys
 import threading
+import time
 import urllib.request
 from tkinter import messagebox
 
@@ -27,35 +34,60 @@ T = THEME
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
 
+# ── Görev fazları ──────────────────────────────────────────────────────────────
+PHASE_IDLE      = "HAZIR"
+PHASE_UPLOADING = "WP YÜKLENİYOR"
+PHASE_RUNNING   = "GÖREV DEVAM EDİYOR"
+PHASE_DROP_WAIT = "DROP BEKLENİYOR"
+PHASE_DROP_DONE = "DROP YAPILDI"
+PHASE_RTL       = "RTL"
+PHASE_DONE      = "TAMAMLANDI"
+
+PHASE_COLORS = {
+    PHASE_IDLE:      "#888888",
+    PHASE_UPLOADING: "#ffab00",
+    PHASE_RUNNING:   "#00e676",
+    PHASE_DROP_WAIT: "#ff8c42",
+    PHASE_DROP_DONE: "#00e676",
+    PHASE_RTL:       "#4488ff",
+    PHASE_DONE:      "#00e676",
+}
+
 
 class DroneApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Ground Control Station")
+        self.title("Ground Control Station — YTÜ Maçka Aerospace")
         self.attributes("-fullscreen", False)
         self.configure(fg_color=T["bg_root"])
         if sys.platform.startswith("win"):
             import ctypes
-            # Benzersiz bir ID ver (şirket.proje.uygulama gibi)
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "ytu.macka.gcs.v3"
+                "ytu.macka.gcs.v4"
             )
-            self.iconbitmap("logo.ico")
+            try:
+                self.iconbitmap("logo.ico")
+            except Exception:
+                pass
 
-
-        self._awaiting_wp_ok = False
+        # ── Durum ──────────────────────────────────────────────────────────────
+        self._awaiting_wp_ok              = False
         self._pending_mission_after_upload = None
-        self._last_shown_alt = None
-        self._last_shown_spd = None
-        self._ALT_THRESHOLD  = 0.3
-        self._SPD_THRESHOLD  = 0.2
-        self._mouse_pitch  = 0.0
-        self._mouse_roll   = 0.0
-        self._mouse_drag   = False
-        self._mouse_last_x = 0
-        self._mouse_last_y = 0
+        self._last_shown_alt              = None
+        self._last_shown_spd              = None
+        self._ALT_THRESHOLD               = 0.3
+        self._SPD_THRESHOLD               = 0.2
+        self._mouse_pitch                 = 0.0
+        self._mouse_roll                  = 0.0
+        self._mouse_drag                  = False
+        self._mouse_last_x                = 0
+        self._mouse_last_y                = 0
+        self._active_task                 = None   # "task1" | "task2" | None
+        self._kill_press_time             = None   # basılı tut mekanizması
+        self._kill_job                    = None
 
         self._setup_ui()
+        self._set_phase(PHASE_IDLE)
 
         self._sik = SiKLink(
             on_message     = lambda m: self.after(0, lambda msg=m: self._handle(msg)),
@@ -66,11 +98,20 @@ class DroneApp(ctk.CTk):
         if MOUSE_IMU_ENABLED:
             self._start_mouse_imu()
 
-    # ------------------------------------------------------------------ send
+    # ──────────────────────────────────────────── faz yönetimi
+    def _set_phase(self, phase: str, extra: str = ""):
+        color = PHASE_COLORS.get(phase, T["text_secondary"])
+        text  = phase + (f"  {extra}" if extra else "")
+        self._lbl_phase.configure(text=text, text_color=color)
+        # Görev süresi: yeni görev başlayınca timer label'ı sıfırla
+        if phase == PHASE_RUNNING:
+            self._lbl_timer.configure(text="00:00")
+
+    # ──────────────────────────────────────────── send
     def _send(self, obj):
         self._sik.send(obj)
 
-    # ------------------------------------------------------------------ msg handler
+    # ──────────────────────────────────────────── mesaj handler
     def _handle(self, msg: dict):
         t = msg.get("type")
 
@@ -134,27 +175,63 @@ class DroneApp(ctk.CTk):
 
         elif t == "status":
             sm = msg.get("msg", "")
-            self._lbl_status.configure(text=sm.upper())
             if sm == "wp_upload_ok":
                 self._awaiting_wp_ok = False
                 p = self._pending_mission_after_upload
                 self._pending_mission_after_upload = None
                 if p in ("task1", "task2"):
                     self._send({"type": "mission", "name": p})
-                    self._lbl_status.configure(text=f"{p.upper()} BASLADI")
+                    self._active_task = p
+                    self._set_phase(PHASE_RUNNING, p.upper())
+
             elif sm == "wp_clear_ok":
-                self._lbl_status.configure(text="WP TEMIZLENDI")
+                self._set_phase(PHASE_IDLE, "WP TEMİZLENDİ")
+
+            elif sm == "mission_complete":
+                # Görev bitti → otomatik RTL
+                if self._active_task == "task1":
+                    self._send({"type": "cmd", "name": "rtl"})
+                    self._set_phase(PHASE_RTL, "OTO")
+                    self._active_task = None
+                elif self._active_task == "task2":
+                    # Task2: önce drop bekleniyor
+                    self._set_phase(PHASE_DROP_WAIT)
+
+            elif sm == "drop_done":
+                self._set_phase(PHASE_DROP_DONE)
+                self.after(1500, lambda: (
+                    self._send({"type": "cmd", "name": "rtl"}),
+                    self._set_phase(PHASE_RTL, "OTO"),
+                ))
+                self._active_task = None
+
+            elif sm == "rtl_complete":
+                self._set_phase(PHASE_DONE)
+                self._active_task = None
+
+        elif t == "drop_target":
+            # RPi görüntü işlemeden hedef koordinat geldi
+            lat = msg.get("lat")
+            lon = msg.get("lon")
+            alt = msg.get("alt", 5.0)
+            if lat is not None and lon is not None:
+                self._set_phase(PHASE_DROP_WAIT, f"{lat:.5f},{lon:.5f}")
+                # GUIDED moda geç ve hedefe git
+                self._send({"type": "cmd", "name": "guided",
+                            "lat": lat, "lon": lon, "alt": alt})
+                # Haritada hedef göster
+                self._map.set_drop_target(float(lat), float(lon))
 
     def _set_link(self, s: str):
         color_map = {
-            "BAGLI": T["ok"],
-            "ZAYIF": T["warn"],
-            "KOPUK": T["danger"],
-            "YENIDEN BAGLANILIYOR...": T["warn"],
+            "BAĞLI":               T["ok"],
+            "ZAYIF":               T["warn"],
+            "KOPUK":               T["danger"],
+            "YENİDEN BAĞLANILIYOR...": T["warn"],
         }
         self._lbl_link.configure(text=s, text_color=color_map.get(s, T["text_secondary"]))
 
-    # ------------------------------------------------------------------ UI
+    # ──────────────────────────────────────────── UI kurulumu
     def _setup_ui(self):
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=0)
@@ -180,7 +257,7 @@ class DroneApp(ctk.CTk):
         self._map = MapWidget(center, on_upload_request=self._on_upload)
         self._map.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
 
-        # Sag panel
+        # Sağ panel
         right = ctk.CTkFrame(self, fg_color=T["bg_card"], corner_radius=0,
                              border_width=1, border_color=T["border"])
         right.grid(row=0, column=1, sticky="nsew")
@@ -208,22 +285,22 @@ class DroneApp(ctk.CTk):
         self._logo_ref = ctk.CTkImage(light_image=img, dark_image=img, size=(70, 60))
         ctk.CTkLabel(logo_frame, image=self._logo_ref, text="").pack(expand=True)
 
-        # Telemetri izgara
+        # Telemetri ızgarası
         tg = TelemetryGrid(hdr)
         tg.grid(row=0, column=1, sticky="nsew", padx=8, pady=6)
 
         self._lbl_mode  = tg.add("MOD",      "--")
         self._lbl_arm   = tg.add("DURUM",    "DISARM")
-        self._lbl_alt   = tg.add("IRTIFA",   "0.0 m")
+        self._lbl_alt   = tg.add("İRTİFA",   "0.0 m")
         self._lbl_spd   = tg.add("HIZ",      "0.0 m/s")
         self._lbl_bat   = tg.add("VOLTAJ",   "0.0 V")
         self._lbl_rem   = tg.add("BATARYA",  "%0")
         self._lbl_cur   = tg.add("AKIM",     "0.0 A")
-        self._lbl_gps   = tg.add("GPS",      "BEKLENIYOR")
+        self._lbl_gps   = tg.add("GPS",      "BEKLENİYOR")
         self._lbl_yaw   = tg.add("YAW",      "0 deg")
-        self._lbl_timer = tg.add("GOREV",    "00:00")
+        self._lbl_timer = tg.add("GÖREV",    "00:00")
 
-        # IMU + link + status
+        # IMU + link + faz durumu
         right_hdr = ctk.CTkFrame(hdr, fg_color="transparent")
         right_hdr.grid(row=0, column=2, sticky="ns", padx=(0, 10), pady=6)
 
@@ -234,22 +311,25 @@ class DroneApp(ctk.CTk):
         link_row.pack(fill="x", pady=(4, 0))
         ctk.CTkLabel(link_row, text="LINK:", font=(T["font_family"], 9),
                      text_color=T["text_secondary"]).pack(side="left")
-        self._lbl_link = ctk.CTkLabel(link_row, text="BEKLENIYOR",
+        self._lbl_link = ctk.CTkLabel(link_row, text="BEKLENİYOR",
                                       font=(T["font_family"], 9, "bold"),
                                       text_color=T["text_secondary"])
         self._lbl_link.pack(side="left", padx=4)
 
-        self._lbl_status = ctk.CTkLabel(right_hdr, text="HAZIR",
-                                        font=(T["font_family"], 9),
-                                        text_color=T["text_secondary"],
-                                        wraplength=120)
-        self._lbl_status.pack(pady=(2, 0))
+        # Görev fazı etiketi (ana yenilik)
+        self._lbl_phase = ctk.CTkLabel(
+            right_hdr, text=PHASE_IDLE,
+            font=(T["font_family"], 10, "bold"),
+            text_color=T["text_secondary"],
+            wraplength=130,
+        )
+        self._lbl_phase.pack(pady=(4, 0))
 
     def _build_right_panel(self, parent):
-        ctk.CTkLabel(parent, text="YTU MACKA",
+        ctk.CTkLabel(parent, text="YTÜ MAÇKA",
                      font=(T["font_family"], 13, "bold"),
                      text_color=T["accent"]).pack(pady=(14, 0))
-        ctk.CTkLabel(parent, text="AEROSPACE GCS",
+        ctk.CTkLabel(parent, text="AEROSPACE GCS  v4",
                      font=(T["font_family"], 9),
                      text_color=T["text_secondary"]).pack(pady=(0, 10))
 
@@ -261,12 +341,12 @@ class DroneApp(ctk.CTk):
         ctk.CTkFrame(parent, height=1, fg_color=T["border"]).pack(fill="x", padx=10)
 
         btn_defs = [
-            ("HOLD",     "#1e2a1e",          T["ok"],     self.cmd_hold),
-            ("RTL",      "#1e1e2a",          "#4488ff",   self.cmd_rtl),
-            ("LAND",     "#1e1e2a",          "#4488ff",   self.cmd_land),
-            ("WP RESET", "#2a1a1a",          T["danger"], self.cmd_wp_clear),
-            ("GOREV 1",  T["bg_card_dark"],  T["accent"], self.cmd_task1),
-            ("GOREV 2",  T["bg_card_dark"],  T["accent"], self.cmd_task2),
+            ("HOLD",     "#1e2a1e",         T["ok"],     self.cmd_hold),
+            ("RTL",      "#1e1e2a",         "#4488ff",   self.cmd_rtl),
+            ("LAND",     "#1e1e2a",         "#4488ff",   self.cmd_land),
+            ("WP RESET", "#2a1a1a",         T["danger"], self.cmd_wp_clear),
+            ("GÖREV 1",  T["bg_card_dark"], T["accent"], self.cmd_task1),
+            ("GÖREV 2",  T["bg_card_dark"], T["accent"], self.cmd_task2),
         ]
         for text, bg, accent, cmd in btn_defs:
             ctk.CTkButton(
@@ -281,20 +361,41 @@ class DroneApp(ctk.CTk):
 
         ctk.CTkFrame(parent, fg_color="transparent").pack(expand=True)
 
-        ctk.CTkButton(
-            parent, text="!  ACIL DURDUR",
+        # Kill — basılı tut mekanizması
+        self._kill_btn = ctk.CTkButton(
+            parent, text="⚠  ACİL DURDUR",
             fg_color="#3a0000", hover_color="#6a0000",
             text_color=T["danger"],
             font=(T["font_family"], 12, "bold"),
             height=42, width=200, corner_radius=4,
             border_width=1, border_color=T["danger"],
-            command=self.cmd_kill,
-        ).pack(pady=(0, 12), padx=10)
+        )
+        self._kill_btn.pack(pady=(0, 12), padx=10)
+        self._kill_btn.bind("<ButtonPress-1>",   self._kill_press)
+        self._kill_btn.bind("<ButtonRelease-1>", self._kill_release)
 
-    # ------------------------------------------------------------------ mouse imu
+    # ──────────────────────────────────────────── kill basılı tut
+    def _kill_press(self, _event=None):
+        self._kill_press_time = time.time()
+        self._kill_btn.configure(text="⚠  BASILI TUT... (2s)")
+        self._kill_job = self.after(2000, self._kill_confirm)
+
+    def _kill_release(self, _event=None):
+        if self._kill_job:
+            self.after_cancel(self._kill_job)
+            self._kill_job = None
+        self._kill_btn.configure(text="⚠  ACİL DURDUR")
+
+    def _kill_confirm(self):
+        self._kill_job = None
+        self._kill_btn.configure(text="⚠  ACİL DURDUR")
+        self._send({"type": "cmd", "name": "kill"})
+        self._set_phase(PHASE_IDLE, "KİLL")
+
+    # ──────────────────────────────────────────── mouse imu
     def _start_mouse_imu(self):
-        self.bind("<ButtonPress-1>",   lambda e: self._mp(e))
-        self.bind("<B1-Motion>",       lambda e: self._mm(e))
+        self.bind("<ButtonPress-1>",   self._mp)
+        self.bind("<B1-Motion>",       self._mm)
         self.bind("<ButtonRelease-1>", lambda e: setattr(self, "_mouse_drag", False))
         self.bind("<ButtonPress-3>",   lambda e: (
             setattr(self, "_mouse_pitch", 0.0),
@@ -316,76 +417,88 @@ class DroneApp(ctk.CTk):
         self._mouse_pitch = max(-90, min(90, self._mouse_pitch - dy * 0.225))
         self._imu.update(self._mouse_pitch, self._mouse_roll)
 
-    # ------------------------------------------------------------------ upload
+    # ──────────────────────────────────────────── upload
     def _on_upload(self, waypoints, mode, spacing_m, alt):
         if not waypoints:
-            messagebox.showwarning("Uyari", "Waypoint yok!"); return
-        if len(waypoints) == 1:
-            messagebox.showwarning("Uyari", "En az 2 WP gerekli!"); return
+            messagebox.showwarning("Uyarı", "Waypoint yok!"); return
         if self._awaiting_wp_ok:
-            self._lbl_status.configure(text="YUKLEME DEVAM EDIYOR"); return
+            self._set_phase(PHASE_UPLOADING, "DEVAM EDİYOR"); return
 
-        if len(waypoints) == 2 and mode == "TASK1":
-            pts = generate_task1_figure8_waypoints(waypoints, n_per_circle=8)
+        if mode == "TASK1":
+            if len(waypoints) != 3:
+                messagebox.showwarning(
+                    "Task1", "Tam 3 WP gerekli:\n  WP1=Direk1  WP2=Direk2  WP3=Pist"
+                ); return
+            pts = generate_task1_figure8_waypoints(waypoints, n_per_circle=12, n_loops=2)
             if len(pts) < 3:
-                messagebox.showwarning("Task1", "Figure-8 uretilemedi."); return
+                messagebox.showwarning("Task1", "Figure-8 üretilemedi."); return
             wp = pts_to_payload(pts, alt)
             self._awaiting_wp_ok = True
             self._pending_mission_after_upload = "task1"
             self._send({"type": "wp_upload", "waypoints": wp, "mission": "task1"})
-            self._lbl_status.configure(text=f"TASK1  {len(wp)} WP")
+            self._set_phase(PHASE_UPLOADING, f"{len(wp)} WP")
 
-        elif len(waypoints) == 2 and mode == "TASK2":
+        elif mode == "TASK2":
+            if len(waypoints) != 4:
+                messagebox.showwarning("Task2", "Tam 4 WP gerekli:\n  WP1-WP2 = Alana gidiş\n  WP3-WP4 = Tarama alanı köşeleri"); return
             pts = generate_task2_scan_waypoints(waypoints, spacing_m=spacing_m)
             if len(pts) < 2:
-                messagebox.showwarning("Task2", "Tarama uretilemedi."); return
+                messagebox.showwarning("Task2", "Tarama üretilemedi."); return
             wp = pts_to_payload(pts, alt)
             self._awaiting_wp_ok = True
             self._pending_mission_after_upload = "task2"
             self._send({"type": "wp_upload", "waypoints": wp, "mission": "task2"})
-            self._lbl_status.configure(text=f"TASK2  {len(wp)} WP")
+            self._set_phase(PHASE_UPLOADING, f"{len(wp)} WP")
 
         else:
             wp = waypoints_to_payload(waypoints, alt)
             self._awaiting_wp_ok = True
             self._pending_mission_after_upload = "task1"
             self._send({"type": "wp_upload", "waypoints": wp, "mission": "task1"})
-            self._lbl_status.configure(text=f"TASK1  {len(wp)} NOKTA")
+            self._set_phase(PHASE_UPLOADING, f"{len(wp)} NOKTA")
 
-    # ------------------------------------------------------------------ commands
+    # ──────────────────────────────────────────── komutlar
     def cmd_hold(self):
         self._send({"type": "cmd", "name": "hold"})
+        self._set_phase(PHASE_IDLE, "LOITER")
 
     def cmd_rtl(self):
         self._send({"type": "cmd", "name": "rtl"})
+        self._set_phase(PHASE_RTL, "MANUEL")
 
     def cmd_land(self):
         self._send({"type": "cmd", "name": "land"})
+        self._set_phase(PHASE_IDLE, "İNİŞ")
 
     def cmd_wp_clear(self):
         if not messagebox.askyesno("WP Sil", "Pixhawk WP'leri silinecek!"): return
         self._send({"type": "wp_clear"})
-        self._lbl_status.configure(text="WP SILME GONDERILDI")
+        self._set_phase(PHASE_IDLE, "WP SİLİNİYOR")
 
     def cmd_task1(self):
-        if not messagebox.askyesno("Task1", "Birinci gorevi baslat?"): return
+        if not messagebox.askyesno("Görev 1", "Figure-8 ×2 görevini başlat?\n\nWP sırası:\n  WP1=Direk1  WP2=Direk2  WP3=Pist"): return
         wps = self._map.waypoints
-        if len(wps) < 2:
-            messagebox.showwarning("Task1", "En az 2 WP sec."); return
+        if len(wps) != 3:
+            messagebox.showwarning("Task1", "Tam 3 WP gerekli:\n  WP1=Direk1  WP2=Direk2  WP3=Pist"); return
         if self._awaiting_wp_ok:
-            self._lbl_status.configure(text="YUKLEME DEVAM EDIYOR"); return
-        self._on_upload(wps, self._map.get_mode(), 3.0, 10.0)
+            self._set_phase(PHASE_UPLOADING, "DEVAM EDİYOR"); return
+        self._on_upload(wps, "TASK1", 3.0,
+                        float(self._map.get_alt() or 10.0))
 
     def cmd_task2(self):
-        if not messagebox.askyesno("Task2", "Ikinci gorevi baslat?"): return
+        if not messagebox.askyesno(
+            "Görev 2",
+            "Tarama + drop görevini başlat?\n\n"
+            "WP sırası:\n  WP1-WP2 = Alana gidiş\n  WP3-WP4 = Tarama alanı köşeleri"
+        ): return
         if self._map.get_mode() != "TASK2":
             messagebox.showwarning("Task2", "Harita modunu TASK2 yap."); return
         wps = self._map.waypoints
-        if len(wps) != 2:
-            messagebox.showwarning("Task2", "Tam 2 WP sec."); return
+        if len(wps) != 4:
+            messagebox.showwarning("Task2", "Tam 4 WP gerekli:\n  WP1-WP2 = Alana gidiş\n  WP3-WP4 = Tarama alanı köşeleri"); return
         if self._awaiting_wp_ok:
-            self._lbl_status.configure(text="YUKLEME DEVAM EDIYOR"); return
-        self._on_upload(wps, "TASK2", 6.0, 20.0)
+            self._set_phase(PHASE_UPLOADING, "DEVAM EDİYOR"); return
+        self._on_upload(wps, "TASK2", self._map.get_spacing(), float(self._map.get_alt() or 10.0))
 
         def _vision():
             try:
@@ -397,9 +510,8 @@ class DroneApp(ctk.CTk):
                 print(f"[Vision] {e}")
         threading.Thread(target=_vision, daemon=True).start()
 
-    def cmd_kill(self):
-        if messagebox.askyesno("ACIL", "MOTORLAR KAPATILACAK! Emin misin?"):
-            self._send({"type": "cmd", "name": "kill"})
+
+
 
 
 if __name__ == "__main__":
